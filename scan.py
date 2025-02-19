@@ -17,7 +17,6 @@ import matplotlib.pyplot as plt
 import itertools
 import math
 import cv2
-from pylsd.lsd import lsd
 
 import argparse
 import os
@@ -93,7 +92,8 @@ class DocScanner(object):
         This is a utility function used by get_contours. The input image is expected 
         to be rescaled and Canny filtered prior to be passed in.
         """
-        lines = lsd(img)
+        lsd = cv2.createLineSegmentDetector()
+        lines = lsd.detect(img)[0]
 
         # massages the output from LSD
         # LSD operates on edges. One "line" has 2 edges, and so we need to combine the edges back into lines
@@ -112,7 +112,7 @@ class DocScanner(object):
             horizontal_lines_canvas = np.zeros(img.shape, dtype=np.uint8)
             vertical_lines_canvas = np.zeros(img.shape, dtype=np.uint8)
             for line in lines:
-                x1, y1, x2, y2, _ = line
+                x1, y1, x2, y2 = line
                 if abs(x2 - x1) > abs(y2 - y1):
                     (x1, y1), (x2, y2) = sorted(((x1, y1), (x2, y2)), key=lambda pt: pt[0])
                     cv2.line(horizontal_lines_canvas, (max(x1 - 5, 0), y1), (min(x2 + 5, img.shape[1] - 1), y2), 255, 2)
@@ -123,7 +123,9 @@ class DocScanner(object):
             lines = []
 
             # find the horizontal lines (connected-components -> bounding boxes -> final lines)
-            (contours, hierarchy) = cv2.findContours(horizontal_lines_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            contours = cv2.findContours(horizontal_lines_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            contours = contours[0]
+            print(contours)
             contours = sorted(contours, key=lambda c: cv2.arcLength(c, True), reverse=True)[:2]
             horizontal_lines_canvas = np.zeros(img.shape, dtype=np.uint8)
             for contour in contours:
@@ -138,7 +140,8 @@ class DocScanner(object):
                 corners.append((max_x, right_y))
 
             # find the vertical lines (connected-components -> bounding boxes -> final lines)
-            (contours, hierarchy) = cv2.findContours(vertical_lines_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            contours = cv2.findContours(vertical_lines_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            contours = contours[0]
             contours = sorted(contours, key=lambda c: cv2.arcLength(c, True), reverse=True)[:2]
             vertical_lines_canvas = np.zeros(img.shape, dtype=np.uint8)
             for contour in contours:
@@ -189,7 +192,7 @@ class DocScanner(object):
 
         # dilate helps to remove potential holes between edge segments
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT,(MORPH,MORPH))
-        dilated = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+        dilated = cv2.dilate(gray, kernel)
 
         # find edges and mark them in the output map using the Canny algorithm
         edged = cv2.Canny(dilated, 0, CANNY)
@@ -287,20 +290,35 @@ class DocScanner(object):
         # apply the perspective transformation
         warped = transform.four_point_transform(orig, screenCnt * ratio)
 
-        # convert the warped image to grayscale
-        gray = cv2.cvtColor(warped, cv2.COLOR_BGR2GRAY)
+        # 1) 컬러 샤프닝
+        blurred = cv2.GaussianBlur(warped, (0, 0), 3)
+        sharpen = cv2.addWeighted(warped, 1.5, blurred, -0.5, 0)
 
-        # sharpen image
-        sharpen = cv2.GaussianBlur(gray, (0,0), 3)
-        sharpen = cv2.addWeighted(gray, 1.5, sharpen, -0.5, 0)
+        # --- [채도 보정 부분 추가] ---
+        # sharpen -> HSV 변환 -> 채도(S 채널) 올리기
+        hsv = cv2.cvtColor(sharpen, cv2.COLOR_BGR2HSV).astype(np.float32)
+        saturation_factor = 1.3  # 1.3 배로 채도 증가(원하는 만큼 조절)
+        hsv[:,:,1] = np.clip(hsv[:,:,1] * saturation_factor, 0, 255)
+        sharpen = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+        # ----------------------------
 
-        # apply adaptive threshold to get black and white effect
-        thresh = cv2.adaptiveThreshold(sharpen, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 21, 15)
+        # 2) 그레이스케일 마스크 생성
+        gray = cv2.cvtColor(sharpen, cv2.COLOR_BGR2GRAY)
+        mask = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 21, 15)
+        mask_inv = cv2.bitwise_not(mask)  # 글자/그림: 255, 배경: 0
 
-        # save the transformed image
+        # 3) 배경(흰색) + 문자/그림(샤프닝 컬러) 합성
+        background = np.full_like(sharpen, 255)
+        color_parts = cv2.bitwise_and(sharpen, sharpen, mask=mask_inv)
+        bg_parts = cv2.bitwise_and(background, background, mask=mask)
+        final = cv2.add(color_parts, bg_parts)
+
         basename = os.path.basename(image_path)
-        cv2.imwrite(OUTPUT_DIR + '/' + basename, thresh)
-        print("Proccessed " + basename)
+        save_path = os.path.join(OUTPUT_DIR, basename)
+        cv2.imwrite(save_path, final)
+        print("Processed (Color Scan):", basename)
+
 
 
 if __name__ == "__main__":
